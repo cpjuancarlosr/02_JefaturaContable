@@ -1,0 +1,826 @@
+/** =========================================================
+ *  Versión Ligera · CFDI MX · Proveedor emoji primero + colores por estado
+ *  Autor: JC · 2025-09-26
+ *  Hojas: Setup, CFDI, Pólizas, Bancos, Reporte
+ *  =========================================================
+*/
+
+/* ===== Hojas ===== */
+const SH_SETUP   = 'Setup';
+const SH_CFDI    = 'CFDI';
+const SH_POLIZAS = 'Pólizas';
+const SH_BANCOS  = 'Bancos';
+const SH_REPORTE = 'Reporte';
+
+/* Tabla “Terceros” dentro de Setup */
+const TERCEROS_HEAD_ROW = 12; // encabezado en Setup fila 12
+
+/* ===== Menú ===== */
+function onOpen(){
+  SpreadsheetApp.getUi().createMenu('Jefatura Contable')
+    .addItem('Cargar XML…','JC_showPicker')
+    .addItem('Generar Previa','JC_buildPreview')
+    .addItem('Emitir Pólizas','JC_emitPolizas')
+    .addSeparator()
+    .addItem('Refrescar Terceros (desde CFDI)','JC_refrescarTerceros')
+    .addItem('Asignar Cuenta de Gasto a RFC…','JC_asignarCuentaGasto')
+    .addItem('Ver póliza por ID…','JC_verPolizaPorID')
+    .addSeparator()
+    .addItem('Importar Banco (CSV/PDF)','JC_importBanco')
+    .addItem('Conciliación','JC_runConciliacion')
+    .addSeparator()
+    .addItem('Refrescar Reporte','JC_refresh')
+    .addSeparator()
+    .addItem('Resetear archivo (solo Sheet1)','JC_resetArchivoSheet1')
+    .addToUi();
+  JC_install(true);
+}
+
+/* ===== Instalación / Estructura ===== */
+function JC_install(silencioso){
+  const ss = SpreadsheetApp.getActive();
+
+  // Setup: parámetros
+  const shS = createIfMissing_(SH_SETUP, ['Parametro','Valor']);
+  if (shS.getLastRow() < 8){
+    shS.getRange(2,1,7,2).setValues([
+      ['RFC_Activo',''],
+      ['Razón_Social',''],
+      ['Modo_IVA','Devengado'], // Devengado / Flujo
+      ['Tipografía','Inter'],
+      ['Color_Principal','#00A878'],
+      ['Dorado','#C9A646'],
+      ['Negro','#000000']
+    ]);
+  }
+  // Terceros (solo estas 5 columnas)
+  setTable_(shS, TERCEROS_HEAD_ROW, ['Tipo','RFC','Nombre','Cuenta_Ingreso','Cuenta_Gasto']);
+
+  // CFDI — nuevo orden (Proveedor emoji primero + links/flags)
+  createIfMissing_(SH_CFDI, [
+    'Proveedor','Link_XML','Link_PDF','ArchivoXML_ID','Con_Póliza','Conciliada','Incluida_Reportes','Periodo',
+    'Tipo','UUID','Fecha','Serie','Folio',
+    'RFC_Emisor','Nombre_Emisor','RFC_Receptor','Nombre_Receptor',
+    'UsoCFDI','Método','Forma_Pago','Moneda','TC','Concepto_Principal',
+    'Subtotal','Descuento','IVA_16','IVA_08','IVA_00','Ret_ISR','Ret_IVA','IEPS','Total',
+    'UUID_Relacionado','Tipo_Relación'
+  ]);
+
+  // Pólizas
+  createIfMissing_(SH_POLIZAS, [
+    'Póliza_ID','Fecha','Tipo_Póliza','Folio','Glosa','Periodo',
+    'Cuenta','Descripción','Debe','Haber','RFC','UUID','Origen','Estado',
+    'Semáforo','Ver_CFDI'
+  ]);
+
+  // Bancos
+  createIfMissing_(SH_BANCOS, [
+    'Fecha','Referencia','Descripción','Monto','Match_Key','Póliza_ID','UUID','Conciliado'
+  ]);
+
+  // Reporte (mínimo)
+  const shR = createIfMissing_(SH_REPORTE, ['Vista','Detalle']);
+  if (shR.getLastRow()<2){
+    shR.getRange('A2').setValue('Balanza simple');
+    shR.getRange('B2').setFormula(`=QUERY('${SH_POLIZAS}'!A:P,"select G, sum(I)-sum(J) group by G label sum(I)-sum(J) ''",0)`);
+  }
+
+  estilizarPolizas_();
+  estilizarCFDI_();        // colores por estado en CFDI
+  if (!silencioso) ss.toast('Listo', 'Setup', 4);
+}
+
+/* ===== UI ===== */
+function JC_showPicker(){
+  const html = HtmlService.createHtmlOutputFromFile('UI').setWidth(520).setHeight(460);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Subir XML/ZIP');
+}
+
+/* ===== Importar (base64) ===== */
+function JC_importarXml(payload){  // [{name, contentBase64}]
+  JC_install(true);
+
+  const sh = ss_(SH_CFDI);
+  const idx = idxHdr_(sh);
+  const colUUID = idx('UUID');
+
+  // UUID existentes
+  const seen = new Set();
+  if (sh.getLastRow()>=2){
+    sh.getRange(2,colUUID,sh.getLastRow()-1,1).getValues().forEach(r=>{
+      const v = String(r[0]||'').trim(); if (v) seen.add(v);
+    });
+  }
+
+  const rfcActivo = (getParam_('RFC_Activo')||'').toUpperCase();
+  const tercIdx = tercerosIndexSetup_(); // {map,gid,start}
+  const tz = Session.getScriptTimeZone() || 'America/Mexico_City';
+
+  const out = [], errores = [];
+  payload.forEach(f=>{
+    try{
+      const dec = decodeXML_(f.contentBase64);
+      const d = parseCFDI_(dec);
+      if (!d.UUID) throw new Error('XML sin UUID');
+      if (seen.has(d.UUID)) { errores.push({archivo:f.name, detalle:'UUID duplicado'}); return; }
+
+      const periodo = d.Fecha ? Utilities.formatDate(new Date(d.Fecha), tz, 'yyyy-mm') : '';
+
+      // Proveedor (emoji al inicio). Solo si es GASTO (nuestro RFC en Receptor).
+      let prov = '';
+      const rol = rfcActivo && rfcActivo===String(d.RFC_Receptor||'').toUpperCase() ? 'GASTO'
+                 : rfcActivo && rfcActivo===String(d.RFC_Emisor||'').toUpperCase() ? 'INGRESO' : 'OTRO';
+      if (rol==='GASTO'){
+        const rfcProv = String(d.RFC_Emisor||'').toUpperCase();
+        const info = tercIdx.map.get(rfcProv);
+        if (!info){
+          prov = '🆕';
+        } else {
+          const link = `#gid=${tercIdx.gid}&range=A${info.row}`;
+          const tag  = (info.cgasto && String(info.cgasto).trim()!=='') ? '✅ #' + info.row : '⚠️ #' + info.row;
+          prov = `=HYPERLINK("${link}","${tag}")`;
+        }
+      }
+
+      // Fila CFDI con nuevo orden y emojis (⚪ por defecto, se actualizará con borrador/emitida)
+      out.push([
+        prov,'','', '', '⚪','⚪','⚪', periodo,
+        d.Tipo, d.UUID, d.Fecha, d.Serie, d.Folio,
+        d.RFC_Emisor, d.Nombre_Emisor, d.RFC_Receptor, d.Nombre_Receptor,
+        d.UsoCFDI, d.Método, d.Forma_Pago, d.Moneda, d.Tipo_Cambio, d.Concepto_Principal,
+        d.Subtotal, d.Descuento, d.IVA_16||0, d.IVA_08||0, d.IVA_00||0, d.Ret_ISR||0, d.Ret_IVA||0, d.IEPS||0, d.Total,
+        d.UUID_Relacionado||'', d.Tipo_Relación||''
+      ]);
+      seen.add(d.UUID);
+    }catch(e){
+      errores.push({archivo:f.name, detalle:(e&&e.message)?e.message:String(e)});
+    }
+  });
+
+  if (out.length) sh.getRange(sh.getLastRow()+1,1,out.length,out[0].length).setValues(out);
+
+  // Actualiza Terceros (sin duplicar)
+  JC_refrescarTerceros();
+
+  // Reaplica formato de CFDI
+  estilizarCFDI_();
+
+  return {insertados: out.length, errores};
+}
+
+/* ===== Previa (sin duplicar) ===== */
+function JC_buildPreview(){
+  const ss = SpreadsheetApp.getActive();
+  const shC = ss_(SH_CFDI);
+  if (shC.getLastRow()<2){ ss.toast('CFDI sin datos.','Previa',4); return; }
+
+  const polIdx = polizaUUIDIndex_(); // { borr:Set, em:Set }
+  const sel = shC.getActiveRange();
+  const hasSel = sel && sel.getRow()>1;
+  const H = idxHdr_(shC);
+  const data = hasSel
+    ? shC.getRange(sel.getRow(),1,sel.getNumRows(),shC.getLastColumn()).getValues()
+    : shC.getRange(2,1,shC.getLastRow()-1,shC.getLastColumn()).getValues();
+
+  const RFC_ACT = (getParam_('RFC_Activo')||'').toUpperCase();
+  const T = tercerosMapSetup_(); // RFC -> {Tipo, Cuenta_Ingreso, Cuenta_Gasto}
+
+  const out = [];
+  const base = Utilities.formatDate(new Date(), Session.getScriptTimeZone()||'America/Mexico_City','yyyyMMddHHmmss');
+  let seq = 0;
+
+  data.forEach(r=>{
+    const tipo = (r[H('Tipo')-1]||'').toString().toUpperCase();
+    const uuid = (r[H('UUID')-1]||'').toString().trim();
+    if (!uuid || polIdx.em.has(uuid) || polIdx.borr.has(uuid)) return;
+
+    const fecha = (r[H('Fecha')-1]||'').toString() || Utilities.formatDate(new Date(), Session.getScriptTimeZone(),'yyyy-MM-dd');
+    const folio = (r[H('Folio')-1]||'').toString();
+    const rfcE  = (r[H('RFC_Emisor')-1]||'').toString().toUpperCase();
+    const rfcR  = (r[H('RFC_Receptor')-1]||'').toString().toUpperCase();
+    const metodo= (r[H('Método')-1]||'').toString().toUpperCase();
+    const forma = (r[H('Forma_Pago')-1]||'').toString();
+    const total = num_(r[H('Total')-1]);
+    const sub   = num_(r[H('Subtotal')-1]) - num_(r[H('Descuento')-1]);
+    const iva16 = num_(r[H('IVA_16')-1]), iva08=num_(r[H('IVA_08')-1]), iva00=num_(r[H('IVA_00')-1]);
+    const retI  = num_(r[H('Ret_ISR')-1]), retV=num_(r[H('Ret_IVA')-1]);
+    const periodo = (r[H('Periodo')-1]||'').toString() || fecha.substring(0,7);
+
+    const rol = RFC_ACT && RFC_ACT===rfcE ? 'INGRESO' : RFC_ACT && RFC_ACT===rfcR ? 'GASTO' : 'OTRO';
+    if (rol==='OTRO') return;
+
+    const polId = `${base}-${++seq}`;
+    const glosa = `${tipo}/${rol} ${uuid}`;
+    const origen = tipo;
+
+    if (tipo==='I'){
+      if (rol==='INGRESO'){
+        pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'Clientes','Clientes', total,0, rfcR,uuid,origen,'Borrador','','']);
+        if (sub)  pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'Ventas','Ventas', 0,sub, rfcR,uuid,origen,'Borrador','','']);
+        if (iva16)pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'IVA Trasladado 16','IVA 16',0,iva16,rfcR,uuid,origen,'Borrador','','']);
+        if (iva08)pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'IVA Trasladado 08','IVA 8',0,iva08,rfcR,uuid,origen,'Borrador','','']);
+        if (iva00)pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'IVA Trasladado 00','IVA 0',0,iva00,rfcR,uuid,origen,'Borrador','','']);
+        if (retI) pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'Ret ISR','Ret ISR x cobrar', retI,0, rfcR,uuid,origen,'Borrador','','']);
+        if (retV) pushPol_(out,[polId,fecha,'Ingreso',folio,glosa,periodo, 'Ret IVA','Ret IVA x cobrar', retV,0, rfcR,uuid,origen,'Borrador','','']);
+      } else {
+        const ctaG = (T.get(rfcE)||{}).Cuenta_Gasto || 'Gastos';
+        if (sub)  pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, ctaG,'CFDI Gasto', sub,0, rfcE,uuid,origen,'Borrador','','']);
+        if (iva16)pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, 'IVA Acreditable 16','IVA Acred 16', iva16,0, rfcE,uuid,origen,'Borrador','','']);
+        if (iva08)pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, 'IVA Acreditable 08','IVA Acred 8', iva08,0, rfcE,uuid,origen,'Borrador','','']);
+        if (iva00)pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, 'IVA Acreditable 00','IVA Acred 0', iva00,0, rfcE,uuid,origen,'Borrador','','']);
+        const aBancos = esPagoInmediato_(metodo, forma);
+        const cuentaH = aBancos ? 'Bancos' : 'Proveedores';
+        pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, cuentaH, aBancos?'Pago inmediato':'Proveedores', 0,total, rfcE,uuid,origen,'Borrador','','']);
+        if (retI) pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, 'Ret ISR','Ret ISR x pagar', 0,retI, rfcE,uuid,origen,'Borrador','','']);
+        if (retV) pushPol_(out,[polId,fecha,'Egreso',folio,glosa,periodo, 'Ret IVA','Ret IVA x pagar', 0,retV, rfcE,uuid,origen,'Borrador','','']);
+      }
+    } else if (tipo==='E'){
+      if (rol==='INGRESO'){
+        if (sub)  pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'Ventas','Reversa ventas (NC)', sub,0, rfcR,uuid,origen,'Borrador','','']);
+        if (iva16)pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'IVA Trasladado 16','Reversa IVA 16', iva16,0, rfcR,uuid,origen,'Borrador','','']);
+        if (iva08)pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'IVA Trasladado 08','Reversa IVA 8', iva08,0, rfcR,uuid,origen,'Borrador','','']);
+        pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'Clientes','Disminuye saldo cliente', 0,total, rfcR,uuid,origen,'Borrador','','']);
+      } else {
+        const ctaG = (T.get(rfcE)||{}).Cuenta_Gasto || 'Gastos';
+        if (sub)  pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, ctaG,'Reversa gasto (NC)', 0,sub, rfcE,uuid,origen,'Borrador','','']);
+        if (iva16)pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'IVA Acreditable 16','Reversa IVA Acred 16', 0,iva16, rfcE,uuid,origen,'Borrador','','']);
+        if (iva08)pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'IVA Acreditable 08','Reversa IVA Acred 8', 0,iva08, rfcE,uuid,origen,'Borrador','','']);
+        pushPol_(out,[polId,fecha,'Diario',folio,glosa,periodo, 'Proveedores','Disminuye saldo proveedor', total,0, rfcE,uuid,origen,'Borrador','','']);
+      }
+    } else if (tipo==='P'){
+      const monto = total || 0;
+      if (rol==='INGRESO' && monto){
+        pushPol_(out,[polId,fecha,'Banco',folio,glosa,periodo, 'Bancos','Cobro a cliente', monto,0, rfcR,uuid,origen,'Borrador','','']);
+        pushPol_(out,[polId,fecha,'Banco',folio,glosa,periodo, 'Clientes','Abono a clientes', 0,monto, rfcR,uuid,origen,'Borrador','','']);
+      } else if (rol==='GASTO' && monto){
+        pushPol_(out,[polId,fecha,'Banco',folio,glosa,periodo, 'Proveedores','Pago a proveedor', monto,0, rfcE,uuid,origen,'Borrador','','']);
+        pushPol_(out,[polId,fecha,'Banco',folio,glosa,periodo, 'Bancos','Salida de bancos', 0,monto, rfcE,uuid,origen,'Borrador','','']);
+      }
+    }
+  });
+
+  if (!out.length){ ss.toast('Nada nuevo (sin duplicar).','Previa',4); return; }
+
+  const shP = ss_(SH_POLIZAS);
+  const insertFrom = shP.getLastRow()+1;
+  shP.getRange(insertFrom,1,out.length,out[0].length).setValues(out);
+  JC_polizaPostProcess_(insertFrom, out.length);
+
+  // Sincroniza estados en CFDI → 🟠 para borradores recién creados
+  updateCFDIStatusFromPolizas_();
+  estilizarCFDI_();
+
+  ss.toast(`Previa lista: ${out.length} renglones.`, 'Previa', 5);
+}
+
+/* ===== Emitir (pasa a ✅) ===== */
+function JC_emitPolizas(){
+  const shP = ss_(SH_POLIZAS);
+  if (shP.getLastRow()<2){ SpreadsheetApp.getActive().toast('No hay Previa.','Pólizas',4); return; }
+
+  const hdr = shP.getRange(1,1,1,shP.getLastColumn()).getValues()[0].map(String);
+  const cID=hdr.indexOf('Póliza_ID')+1, cDeb=hdr.indexOf('Debe')+1, cHab=hdr.indexOf('Haber')+1, cEst=hdr.indexOf('Estado')+1, cUUID=hdr.indexOf('UUID')+1;
+
+  // UUID ya emitidos
+  const emSet = new Set();
+  for (let r=2;r<=shP.getLastRow();r++){
+    const est = String(shP.getRange(r,cEst).getValue()||'');
+    const u   = String(shP.getRange(r,cUUID).getValue()||'').trim();
+    if (est==='Emitida' && u) emSet.add(u);
+  }
+
+  // Validación por póliza
+  const vals = shP.getRange(2,1,shP.getLastRow()-1,shP.getLastColumn()).getValues();
+  const por = new Map(); // id -> {debe, haber, uuids:Set}
+  vals.forEach(r=>{
+    const est = String(r[cEst-1]||'');
+    if (est!=='Borrador') return;
+    const id = String(r[cID-1]||''); if (!id) return;
+    const u  = String(r[cUUID-1]||'').trim();
+    if (!por.has(id)) por.set(id,{debe:0,haber:0,uuids:new Set()});
+    por.get(id).debe  += num_(r[cDeb-1]);
+    por.get(id).haber += num_(r[cHab-1]);
+    if (u) por.get(id).uuids.add(u);
+  });
+
+  const problemas = [];
+  const bloquear = new Set();
+  por.forEach((o,id)=>{
+    if (Math.abs(o.debe - o.haber) > 0.005){ problemas.push(`Descuadre en ${id}`); bloquear.add(id); }
+    o.uuids.forEach(u=>{ if (emSet.has(u)){ problemas.push(`UUID ya emitido: ${u}`); bloquear.add(id); } });
+  });
+  if (problemas.length){
+    SpreadsheetApp.getUi().alert('No se puede emitir:\n- ' + problemas.join('\n- '));
+    return;
+  }
+
+  // Emitir
+  for (let r=2;r<=shP.getLastRow();r++){
+    const est = String(shP.getRange(r,cEst).getValue()||'');
+    const id  = String(shP.getRange(r,cID).getValue()||'');
+    if (est==='Borrador' && !bloquear.has(id)){
+      shP.getRange(r,cEst).setValue('Emitida');
+    }
+  }
+
+  // Sincroniza estados en CFDI → ✅
+  updateCFDIStatusFromPolizas_();
+  estilizarCFDI_();
+
+  SpreadsheetApp.getActive().toast('Pólizas emitidas.','Pólizas',4);
+}
+
+/* ===== Sincronizar Con_Póliza en CFDI desde Pólizas ===== */
+function updateCFDIStatusFromPolizas_(){
+  const shC = ss_(SH_CFDI);
+  const shP = ss_(SH_POLIZAS);
+  if (!shC || !shP || shC.getLastRow()<2) return;
+
+  const HC = idxHdr_(shC);
+  const HP = idxHdr_(shP);
+
+  // Estado por UUID: prioridad Emitida > Borrador
+  const state = new Map(); // uuid -> '✅' | '🟠'
+  if (shP.getLastRow()>=2){
+    const vals = shP.getRange(2,1,shP.getLastRow()-1,shP.getLastColumn()).getValues();
+    vals.forEach(r=>{
+      const u = String(r[HP('UUID')-1]||'').trim(); if (!u) return;
+      const e = String(r[HP('Estado')-1]||'');
+      if (e==='Emitida') { state.set(u,'✅'); }
+      else if (e==='Borrador' && !state.has(u)) { state.set(u,'🟠'); }
+    });
+  }
+
+  const colCon = HC('Con_Póliza');
+  const colUUID= HC('UUID');
+  if (colCon<1 || colUUID<1) return;
+
+  const n = shC.getLastRow()-1;
+  if (n<=0) return;
+  const uuids = shC.getRange(2,colUUID,n,1).getValues().map(r=>String(r[0]||'').trim());
+  const curr  = shC.getRange(2,colCon,n,1).getValues();
+  const out   = curr.map((r,i)=>{
+    const u = uuids[i]; const s = state.get(u) || '⚪';
+    return [s];
+  });
+  shC.getRange(2,colCon,n,1).setValues(out);
+}
+
+/* ===== Terceros en Setup ===== */
+function JC_refrescarTerceros(){
+  const shC = ss_(SH_CFDI);
+  if (!shC || shC.getLastRow()<2) return;
+
+  const RFC_ACT = (getParam_('RFC_Activo')||'').toUpperCase();
+  if (!RFC_ACT){ SpreadsheetApp.getActive().toast('Define RFC_Activo en Setup.','Terceros',4); return; }
+
+  const H = idxHdr_(shC);
+  const all = shC.getRange(2,1,shC.getLastRow()-1, shC.getLastColumn()).getValues();
+
+  const shS = ss_(SH_SETUP);
+  const headRow = TERCEROS_HEAD_ROW;
+  setTable_(shS, headRow, ['Tipo','RFC','Nombre','Cuenta_Ingreso','Cuenta_Gasto']);
+
+  // RFC existentes
+  const exist = new Set();
+  const last = shS.getLastRow();
+  if (last > headRow){
+    shS.getRange(headRow+1,2, last-headRow, 1).getValues().forEach(r=>{
+      const v = String(r[0]||'').toUpperCase(); if (v) exist.add(v);
+    });
+  }
+
+  const addRows = [];
+  all.forEach(r=>{
+    const rfcE = String(r[H('RFC_Emisor')-1]||'').toUpperCase();
+    const nomE = String(r[H('Nombre_Emisor')-1]||'');
+    const rfcR = String(r[H('RFC_Receptor')-1]||'').toUpperCase();
+    const nomR = String(r[H('Nombre_Receptor')-1]||'');
+
+    if (RFC_ACT===rfcE && rfcR && !exist.has(rfcR)){
+      addRows.push(['Cliente', rfcR, nomR, '', '']); exist.add(rfcR);
+    }
+    if (RFC_ACT===rfcR && rfcE && !exist.has(rfcE)){
+      addRows.push(['Proveedor', rfcE, nomE, '', '']); exist.add(rfcE);
+    }
+  });
+
+  if (addRows.length){
+    shS.getRange(shS.getLastRow()+1,1,addRows.length,addRows[0].length).setValues(addRows);
+  }
+  SpreadsheetApp.getActive().toast('Terceros actualizados.', 'Setup', 4);
+}
+
+function JC_asignarCuentaGasto(){
+  const ui = SpreadsheetApp.getUi();
+  const r1 = ui.prompt('Cuenta de Gasto por RFC','RFC del proveedor:', ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton()!==ui.Button.OK) return;
+  const RFC = String(r1.getResponseText()||'').toUpperCase().trim(); if (!RFC) return;
+  const r2 = ui.prompt('Cuenta de Gasto','Cuenta contable (texto exacto):', ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton()!==ui.Button.OK) return;
+  const Cta = String(r2.getResponseText()||'').trim();
+
+  const shS = ss_(SH_SETUP);
+  const start = TERCEROS_HEAD_ROW+1;
+  const last = shS.getLastRow();
+  if (last < start){ SpreadsheetApp.getActive().toast('Tabla Terceros vacía.','Setup',4); return; }
+
+  const rng = shS.getRange(start,1,last-start+1,5);
+  const vals = rng.getValues();
+  let done = false;
+  for (let i=0;i<vals.length;i++){
+    const rfc = String(vals[i][1]||'').toUpperCase();
+    if (rfc===RFC){
+      vals[i][4] = Cta; // Cuenta_Gasto (col E)
+      done = true; break;
+    }
+  }
+  if (done){ rng.setValues(vals); SpreadsheetApp.getActive().toast('Cuenta de Gasto asignada.','Setup',4); }
+  else { SpreadsheetApp.getActive().toast('RFC no encontrado en Terceros.','Setup',4); }
+}
+
+/* ===== Vista por póliza ===== */
+function JC_verPolizaPorID(){
+  const ui = SpreadsheetApp.getUi();
+  const ans = ui.prompt('Ver póliza','Escribe el Póliza_ID:', ui.ButtonSet.OK_CANCEL);
+  if (ans.getSelectedButton()!==ui.Button.OK) return;
+  const pid = String(ans.getResponseText()||'').trim(); if (!pid) return;
+
+  const shP = ss_(SH_POLIZAS);
+  const hdr = shP.getRange(1,1,1,shP.getLastColumn()).getValues()[0].map(String);
+  const vals = shP.getDataRange().getValues().slice(1);
+  const rows = vals.filter(r=> String(r[0]||'').trim()===pid);
+  const ss = SpreadsheetApp.getActive();
+  const name = `Poliza_${pid.slice(-6)}`;
+  const sh = ss.insertSheet(name);
+  sh.getRange(1,1,1,hdr.length).setValues([hdr]).setFontWeight('bold').setBackground('#efefef');
+  if (rows.length) sh.getRange(2,1,rows.length,hdr.length).setValues(rows);
+  sh.setFrozenRows(1); sh.autoResizeColumns(1,hdr.length);
+  SpreadsheetApp.getActive().toast('Vista creada','Pólizas',4);
+}
+
+/* ===== Banco ===== */
+function JC_importBanco(){
+  SpreadsheetApp.getUi().alert(
+    `Importa tu CSV a la hoja "${SH_BANCOS}" (Archivo → Importar).
+Luego ejecuta “Conciliación”.`
+  );
+}
+function JC_runConciliacion(){
+  const sh = ss_(SH_BANCOS);
+  if (!sh || sh.getLastRow()<2){ SpreadsheetApp.getActive().toast('Bancos vacío.','Banco',4); return; }
+  const hdr = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  const cF=hdr.indexOf('Fecha')+1, cM=hdr.indexOf('Monto')+1, cK=hdr.indexOf('Match_Key')+1;
+  const tz = Session.getScriptTimeZone() || 'America/Mexico_City';
+  const vals = sh.getRange(2,1,sh.getLastRow()-1,sh.getLastColumn()).getValues();
+  const out = vals.map(r=>{
+    const f = r[cF-1]; const m = Math.round(num_(r[cM-1]));
+    const ymd = f ? Utilities.formatDate(new Date(f), tz, 'yyyyMMdd') : '';
+    return [ymd + '|' + m];
+  });
+  sh.getRange(2,cK,out.length,1).setValues(out);
+  SpreadsheetApp.getActive().toast('Match_Key listo.','Banco',4);
+}
+
+/* ===== Reporte ===== */
+function JC_refresh(){ JC_install(true); SpreadsheetApp.getActive().toast('Reporte listo.','Reporte',3); }
+
+/* ===== Reset a Sheet1 ===== */
+function JC_resetArchivoSheet1(){
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.prompt(
+    'Resetear archivo',
+    'Esto eliminará TODAS las hojas y dejará solo "Sheet1" en blanco. Escribe: RESET',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (res.getSelectedButton() !== ui.Button.OK) return;
+  if (String(res.getResponseText() || '').trim().toUpperCase() !== 'RESET'){
+    ui.alert('Acción cancelada. Escribe exactamente: RESET'); return;
+  }
+  const ss = SpreadsheetApp.getActive();
+  let sh1 = ss.getSheetByName('Sheet1');
+  if (!sh1) sh1 = ss.insertSheet('Sheet1');
+  const keepId = sh1.getSheetId();
+  ss.getSheets().forEach(s => { if (s.getSheetId() !== keepId) ss.deleteSheet(s); });
+  try { (sh1.getBandings() || []).forEach(b => b.remove()); } catch(e){}
+  try { sh1.setConditionalFormatRules([]); } catch(e){}
+  sh1.clear({contentsOnly:false}); sh1.setFrozenRows(0); sh1.setFrozenColumns(0); sh1.setTabColor(null); sh1.activate();
+  try { ss.getNamedRanges().forEach(nr => nr.remove()); } catch(e){}
+  ss.toast('Listo: solo “Sheet1”.', 'Reset', 5);
+  ui.alert('Hecho', 'Se dejó el archivo con solo "Sheet1" en blanco.', ui.ButtonSet.OK);
+}
+
+/* ===== Post-proceso de Pólizas ===== */
+function JC_polizaPostProcess_(startRow, count){
+  const shP = ss_(SH_POLIZAS);
+  const shC = ss_(SH_CFDI);
+  if (!shP || !shC || count <= 0) return;
+
+  const gid = shC.getSheetId();
+  const idxP = idxHdr_(shP);
+  const cEst = idxP('Estado'), cSem = idxP('Semáforo'), cUUID = idxP('UUID'), cLink = idxP('Ver_CFDI');
+  if (cEst < 1) return;
+
+  const endRow = startRow + count - 1;
+
+  // Semáforo
+  if (cSem > 0) {
+    const colEst = colLetter_(cEst);
+    for (let r = startRow; r <= endRow; r++) {
+      shP.getRange(r, cSem).setFormula(`=IFS($${colEst}${r}="Emitida","🟢",$${colEst}${r}="Borrador","🟠",TRUE,"⚪")`);
+    }
+  }
+  // Link a CFDI
+  if (cUUID > 0 && cLink > 0) {
+    const idxC = idxHdr_(shC);
+    const colU_CFDI = idxC('UUID');
+    const mapRowC = new Map();
+    if (shC.getLastRow() >= 2) {
+      const n = shC.getLastRow() - 1;
+      shC.getRange(2, colU_CFDI, n, 1).getValues().forEach((r, i) => {
+        const u = String(r[0] || '').trim();
+        if (u) mapRowC.set(u, 2 + i);
+      });
+    }
+    const uuids = shP.getRange(startRow, cUUID, count, 1).getValues().map(r => String(r[0] || '').trim());
+    const outLinks = uuids.map(u => {
+      const rowC = mapRowC.get(u);
+      return [ rowC ? `=HYPERLINK("#gid=${gid}&range=A${rowC}","Ver CFDI")` : '' ];
+    });
+    shP.getRange(startRow, cLink, count, 1).setValues(outLinks);
+  }
+}
+
+/* ===== Estilo Pólizas ===== */
+function estilizarPolizas_(){
+  const sh = ss_(SH_POLIZAS);
+  if (!sh) return;
+
+  const lastRow = Math.max(sh.getLastRow(), 2);
+  const lastCol = Math.max(sh.getLastColumn(), 1);
+  const dataRows = Math.max(lastRow - 1, 1);
+  const dataRange = sh.getRange(2, 1, dataRows, lastCol);
+
+  try { sh.setConditionalFormatRules([]); } catch (_) {}
+
+  const cEst = idxHdr_(sh)('Estado');
+  if (cEst > 0) {
+    const colLet = colLetter_(cEst);
+    const ruleEmitida = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLet}2="Emitida"`)
+      .setBackground('#E7F6EC')
+      .setRanges([dataRange]).build();
+    const ruleBorrador = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLet}2="Borrador"`)
+      .setBackground('#FFF6E5')
+      .setRanges([dataRange]).build();
+    sh.setConditionalFormatRules([ruleEmitida, ruleBorrador]);
+  }
+  try { (sh.getBandings() || []).forEach(b => b.remove()); } catch(_) {}
+  try { dataRange.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY); } catch(_) {}
+}
+
+/* ===== Estilo CFDI — colores por Con_Póliza (✅/🟠/⚪) ===== */
+function estilizarCFDI_(){
+  const sh = ss_(SH_CFDI);
+  if (!sh) return;
+
+  const lastRow = Math.max(sh.getLastRow(), 2);
+  const lastCol = Math.max(sh.getLastColumn(), 1);
+  const dataRows = Math.max(lastRow - 1, 1);
+  const dataRange = sh.getRange(2, 1, dataRows, lastCol);
+
+  // Limpia y aplica reglas
+  try { sh.setConditionalFormatRules([]); } catch (_) {}
+
+  const cCon = idxHdr_(sh)('Con_Póliza');
+  if (cCon > 0){
+    const colLet = colLetter_(cCon);
+
+    const rEmit = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLet}2="✅"`)
+      .setBackground('#E7F6EC').setRanges([dataRange]).build();
+
+    const rBorr = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLet}2="🟠"`)
+      .setBackground('#FFF6E5').setRanges([dataRange]).build();
+
+    const rNada = SpreadsheetApp.newConditionalFormatRule()
+      .whenFormulaSatisfied(`=$${colLet}2="⚪"`)
+      .setBackground('#F4F4F4').setRanges([dataRange]).build();
+
+    sh.setConditionalFormatRules([rEmit, rBorr, rNada]);
+  }
+
+  // Zebra
+  try { (sh.getBandings() || []).forEach(b => b.remove()); } catch(_) {}
+  try { dataRange.applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY); } catch(_) {}
+
+  // Congela encabezado
+  sh.setFrozenRows(1);
+}
+
+/* ===== Índices de Pólizas para duplicados ===== */
+function polizaUUIDIndex_(){
+  const shP = ss_(SH_POLIZAS);
+  const out = { borr:new Set(), em:new Set() };
+  if (!shP || shP.getLastRow()<2) return out;
+  const H = idxHdr_(shP);
+  const vals = shP.getRange(2,1,shP.getLastRow()-1,shP.getLastColumn()).getValues();
+  vals.forEach(r=>{
+    const u = String(r[H('UUID')-1]||'').trim();
+    const e = String(r[H('Estado')-1]||'');
+    if (!u) return;
+    if (e==='Borrador') out.borr.add(u);
+    if (e==='Emitida')  out.em.add(u);
+  });
+  return out;
+}
+
+/* ===== Mapas / util ===== */
+function tercerosMapSetup_(){
+  const sh = ss_(SH_SETUP);
+  const map = new Map();
+  if (!sh) return map;
+  const start = TERCEROS_HEAD_ROW+1;
+  const last = sh.getLastRow();
+  if (last < start) return map;
+  const vals = sh.getRange(start,1,last-start+1,5).getValues();
+  vals.forEach(r=>{
+    const rfc = String(r[1]||'').toUpperCase(); if(!rfc) return;
+    map.set(rfc, {Tipo:String(r[0]||''), Cuenta_Ingreso:String(r[3]||''), Cuenta_Gasto:String(r[4]||'')});
+  });
+  return map;
+}
+function tercerosIndexSetup_(){
+  const sh = ss_(SH_SETUP);
+  const map = new Map();
+  const gid = sh.getSheetId();
+  const start = TERCEROS_HEAD_ROW+1;
+  const last = sh.getLastRow();
+  if (last >= start){
+    const vals = sh.getRange(start,1,last-start+1,5).getValues();
+    vals.forEach((r,i)=>{
+      const rfc = String(r[1]||'').toUpperCase();
+      if (rfc) map.set(rfc, {row:start+i, tipo:String(r[0]||''), cing:String(r[3]||''), cgasto:String(r[4]||'')});
+    });
+  }
+  return {map,gid,start};
+}
+function cuentasMinimas_(){ return {
+  'Clientes':'Clientes','Proveedores':'Proveedores','Bancos':'Bancos',
+  'Ventas':'Ventas','Gastos':'Gastos',
+  'IVA Trasladado 16':'IVA Trasladado 16','IVA Trasladado 08':'IVA Trasladado 08','IVA Trasladado 00':'IVA Trasladado 00',
+  'IVA Acreditable 16':'IVA Acreditable 16','IVA Acreditable 08':'IVA Acreditable 08','IVA Acreditable 00':'IVA Acreditable 00',
+  'Ret ISR':'Ret ISR','Ret IVA':'Ret IVA'
+};}
+function esPagoInmediato_(metodo, forma){
+  if (String(metodo||'').toUpperCase()!=='PUE') return false;
+  const f = String(forma||'').padStart(2,'0');
+  return ['01','02','03','04','28','29'].indexOf(f)>=0;
+}
+
+function ss_(name){ return SpreadsheetApp.getActive().getSheetByName(name); }
+function createIfMissing_(name, headers){
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow()===0) sh.getRange(1,1,1,headers.length).setValues([headers]);
+  sh.setFrozenRows(1);
+  sh.getRange(1,1,1,headers.length).setFontWeight('bold').setBackground('#efefef');
+  return sh;
+}
+function setTable_(sh, headRow, headers){
+  sh.getRange(headRow,1,1,headers.length).setValues([headers]).setFontWeight('bold').setBackground('#eef3f7');
+}
+function getParam_(key){
+  const sh = ss_(SH_SETUP);
+  const vals = sh.getRange(2,1, Math.max(1, sh.getLastRow()-1), 2).getValues();
+  for (let i=0;i<vals.length;i++){ if (String(vals[i][0]||'')===key) return String(vals[i][1]||''); }
+  return '';
+}
+function idxHdr_(sh){
+  const hdr = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(h=>String(h||'').trim());
+  const map = new Map(); hdr.forEach((h,i)=> map.set(h.toLowerCase(), i+1));
+  const f = (name)=> map.get(String(name||'').toLowerCase())||-1; f.map=map; return f;
+}
+function num_(x){ const n=Number(x); return isNaN(n)?0:n; }
+function colLetter_(n){ let s=''; while(n>0){ let m=(n-1)%26; s=String.fromCharCode(65+m)+s; n=(n-m-1)/26;} return s; }
+function pushPol_(out,row){ out.push(row); }
+
+/* ===== XML decode + parse ===== */
+function decodeXML_(b64){
+  const bytes = Utilities.base64Decode(b64);
+  if (bytes[0]===0x50 && bytes[1]===0x4B){ // ZIP
+    const blobs = Utilities.unzip(Utilities.newBlob(bytes));
+    const xmlBlob = blobs.find(b=> (b.getName()||'').toLowerCase().endsWith('.xml'));
+    if (!xmlBlob) throw new Error('ZIP sin XML.');
+    return cleanXML_(xmlBlob.getDataAsString());
+  }
+  let s = Utilities.newBlob(bytes).getDataAsString();
+  if (!s || s.indexOf('<')<0) s = Utilities.newBlob(bytes).getDataAsString('ISO-8859-1');
+  return cleanXML_(s);
+}
+function cleanXML_(s){
+  s = (s||'').replace(/^\uFEFF/,'');
+  const i = s.indexOf('<'); if (i>0) s = s.slice(i);
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g,'');
+  return s.trim();
+}
+function parseCFDI_(xmlText){
+  const doc  = XmlService.parse(xmlText);
+  const root = doc.getRootElement();
+  const ns   = {
+    cfdi: root.getNamespace(), // 3.3/4.0
+    tfd:  XmlService.getNamespace('tfd','http://www.sat.gob.mx/TimbreFiscalDigital'),
+    p20:  XmlService.getNamespace('pago20','http://www.sat.gob.mx/Pagos20')
+  };
+  const g = (el,att)=> el?.getAttribute(att)?.getValue()||'';
+  const num = (v)=> v? Number(v)||0 : 0;
+
+  const comp = root, em = comp.getChild('Emisor',ns.cfdi), re = comp.getChild('Receptor',ns.cfdi);
+  const compo = comp.getChild('Complemento',ns.cfdi);
+
+  // UUID
+  let UUID=''; if (compo){
+    compo.getChildren().forEach(h=>{
+      if (h.getNamespace() && h.getNamespace().getURI()===ns.tfd.getURI() && h.getName()==='TimbreFiscalDigital'){
+        UUID = g(h,'UUID')||'';
+      }
+    });
+  }
+  // Concepto principal
+  const c0 = comp.getChild('Conceptos',ns.cfdi)?.getChildren('Concepto',ns.cfdi)?.[0];
+  const concepto = c0 ? ((g(c0,'ClaveProdServ')||'')+': '+(g(c0,'Descripcion')||'')) : '';
+
+  const data = {
+    Tipo: g(comp,'TipoDeComprobante')||'',
+    UUID, Serie:g(comp,'Serie')||'', Folio:g(comp,'Folio')||'', Fecha:g(comp,'Fecha')||'',
+    RFC_Emisor:g(em,'Rfc')||'', Nombre_Emisor:g(em,'Nombre')||'',
+    RFC_Receptor:g(re,'Rfc')||'', Nombre_Receptor:g(re,'Nombre')||'',
+    UsoCFDI:g(re,'UsoCFDI')||'', Método:g(comp,'MetodoPago')||'', Forma_Pago:g(comp,'FormaPago')||'',
+    Moneda:g(comp,'Moneda')||'MXN', Tipo_Cambio:g(comp,'TipoCambio')||'',
+    Subtotal:num(g(comp,'SubTotal'))||0, Descuento:num(g(comp,'Descuento'))||0, Total:num(g(comp,'Total'))||0,
+    Concepto_Principal: concepto
+  };
+
+  // Impuestos globales
+  const imp = comp.getChild('Impuestos',ns.cfdi);
+  if (imp){
+    const tras = imp.getChild('Traslados',ns.cfdi)?.getChildren('Traslado',ns.cfdi)||[];
+    tras.forEach(t=>{
+      const tasa = num(g(t,'TasaOCuota')); const impi = num(g(t,'Importe'))||0;
+      if (Math.abs(tasa-0.16)<1e-6) data.IVA_16 = (data.IVA_16||0)+impi;
+      else if (Math.abs(tasa-0.08)<1e-6) data.IVA_08 = (data.IVA_08||0)+impi;
+      else data.IVA_00 = (data.IVA_00||0)+impi;
+      if (g(t,'Impuesto')==='003') data.IEPS = (data.IEPS||0)+impi;
+    });
+    const rets = imp.getChild('Retenciones',ns.cfdi)?.getChildren('Retencion',ns.cfdi)||[];
+    rets.forEach(r=>{
+      const impId = g(r,'Impuesto'); const impi = num(g(r,'Importe'))||0;
+      if (impId==='001') data.Ret_ISR = (data.Ret_ISR||0)+impi;
+      if (impId==='002') data.Ret_IVA = (data.Ret_IVA||0)+impi;
+    });
+  }
+
+  // Relación (E/P) y pagos 2.0
+  let relUUID='', relTipo='';
+  const rels = comp.getChildren('CfdiRelacionados',ns.cfdi)||[];
+  rels.forEach(R=>{
+    if (!relTipo) relTipo = g(R,'TipoRelacion')||'';
+    (R.getChildren('CfdiRelacionado',ns.cfdi)||[]).forEach(h=>{ const u=g(h,'UUID'); if(u && !relUUID) relUUID=u; });
+  });
+  const compoPag = compo?.getChild('Pagos',ns.p20);
+  if (compoPag){
+    data.Tipo = 'P';
+    let pagoMonto = 0;
+    (compoPag.getChildren('Pago',ns.p20)||[]).forEach(pg=>{
+      const m = num(g(pg,'Monto'))||0; if (m>pagoMonto) pagoMonto=m;
+      (pg.getChildren('DoctoRelacionado',ns.p20)||[]).forEach(d=>{
+        const u=g(d,'IdDocumento'); if (u && !relUUID) relUUID=u;
+        const ip=num(g(d,'ImpPagado'))||0; if (ip>pagoMonto) pagoMonto=ip;
+      });
+    });
+    data.Total = data.Total || pagoMonto;
+    if (!relTipo) relTipo='PAGO';
+  }
+  data.UUID_Relacionado = relUUID; data.Tipo_Relación = relTipo;
+
+  return data;
+}
+
+/* ===== onEdit opcional (RFC_Activo) ===== */
+function onEdit(e){
+  try{
+    if (!e) return;
+    const sh = e.range.getSheet();
+    if (sh.getName() !== SH_SETUP) return;
+    if (e.range.getRow()===2 && e.range.getColumn()===2){
+      JC_refrescarTerceros();
+      SpreadsheetApp.getActive().toast('RFC activo actualizado.', 'Setup', 3);
+    }
+  }catch(err){
+    SpreadsheetApp.getActive().toast('onEdit: '+(err && err.message ? err.message : err), 'Error', 6);
+  }
+}
+
