@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Subir XML/ZIP</title>
+<style>
+  body{font-family:Inter,system-ui,Arial;margin:0}
+  header{padding:10px 14px;border-bottom:1px solid #eee;font-weight:700}
+  .box{padding:14px}
+  .drop{border:2px dashed #cfd6dc;border-radius:10px;padding:16px;text-align:center;background:#fafafa}
+  .drop.over{border-color:#00A878;background:#f0fff8}
+  .row{display:flex;gap:8px;align-items:center;margin-top:10px}
+  .btn{border:0;border-radius:8px;padding:8px 12px;font-weight:600;cursor:pointer}
+  .primary{background:#00A878;color:#fff}
+  .ghost{background:#eef3f7}
+  .muted{color:#666;font-size:12px}
+  .list{max-height:160px;overflow:auto;margin-top:10px}
+</style>
+</head>
+<body>
+<header>Subir XML/ZIP</header>
+<div class="box">
+  <div id="drop" class="drop">
+    <p><b>Arrastra aquí</b> o <label for="f" class="btn ghost">Elegir…</label></p>
+    <input id="f" type="file" accept=".xml,.zip" multiple style="display:none">
+    <div class="muted" id="cnt">0 archivos</div>
+  </div>
+  <div class="list" id="list"></div>
+  <div class="row">
+    <button id="send" class="btn primary" disabled>Cargar a CFDI</button>
+    <button class="btn ghost" onclick="google.script.host.close()">Cerrar</button>
+    <div style="flex:1"></div>
+    <span id="msg" class="muted"></span>
+  </div>
+</div>
+<script>
+const f = document.getElementById('f');
+const drop = document.getElementById('drop');
+const send = document.getElementById('send');
+const cnt = document.getElementById('cnt');
+const list = document.getElementById('list');
+const msg = document.getElementById('msg');
+let files = [];
+
+drop.addEventListener('dragover', e=>{e.preventDefault(); drop.classList.add('over');});
+drop.addEventListener('dragleave', ()=> drop.classList.remove('over'));
+drop.addEventListener('drop', e=>{
+  e.preventDefault(); drop.classList.remove('over'); addFiles(e.dataTransfer.files);
+});
+f.addEventListener('change', e=> addFiles(e.target.files));
+function addFiles(fl){ files = files.concat([...fl].filter(x=>/\.xml$|\.zip$/i.test(x.name))); render(); }
+function render(){
+  cnt.textContent = files.length + ' archivos';
+  send.disabled = files.length===0;
+  list.innerHTML = files.map((x,i)=> `<div>${x.name} <a href="#" data-i="${i}">quitar</a></div>`).join('');
+  list.querySelectorAll('a').forEach(a=> a.onclick = e=>{ e.preventDefault(); files.splice(+a.dataset.i,1); render(); });
+}
+function toBase64(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(btoa(String.fromCharCode(...new Uint8Array(r.result)))); r.onerror=rej; r.readAsArrayBuffer(file); }); }
+send.onclick = async ()=>{
+  send.disabled = true; msg.textContent = 'Cargando…';
+  try{
+    const payload = [];
+    for (let i=0;i<files.length;i++){
+      payload.push({name: files[i].name, contentBase64: await toBase64(files[i])});
+    }
+    google.script.run
+      .withSuccessHandler(res=>{
+        msg.textContent = `Insertados: ${res.insertados}, Errores: ${res.errores.length}`;
+        if (res.errores.length){
+          alert('Errores:\n' + res.errores.map(e=>`- ${e.archivo}: ${e.detalle}`).join('\n'));
+        }
+        send.disabled = false;
+      })
+      .withFailureHandler(err=>{
+        msg.textContent = 'Error: ' + (err && err.message ? err.message : err);
+        send.disabled = false;
+      })
+      .JC_importarXml(payload);
+  }catch(e){
+    msg.textContent = 'Error local: ' + (e && e.message ? e.message : e);
+    send.disabled = false;
+  }
+};
+</script>
+</body>
+</html>
